@@ -1,10 +1,10 @@
 const express = require('express');
-const multer = require('multer');
+const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
-const { v4: uuidv4 } = require('uuid');
-const db = require('../database');
-const { authenticate } = require('../middleware/auth');
+const multer = require('multer');
+const { queryOne, queryAll, runQuery } = require('../database');
+const { authenticateToken, getCurrentUser } = require('../middleware/auth');
 
 const router = express.Router();
 
@@ -15,68 +15,126 @@ if (!fs.existsSync(uploadDir)) {
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const subDir = req.headers['evidence-type'] || 'general';
-    const targetDir = path.join(uploadDir, subDir);
-    if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
-    cb(null, targetDir);
+    cb(null, uploadDir);
   },
   filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `${Date.now()}_${uuidv4().replace(/-/g, '').substring(0, 8)}${ext}`);
-  }
-});
-const upload = multer({
-  storage,
-  limits: { fileSize: 50 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    const allowed = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.txt', '.zip', '.rar', '.7z'];
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (allowed.includes(ext)) cb(null, true);
-    else cb(new Error('不支持的文件类型'));
+    const uniqueName = `${Date.now()}-${uuidv4()}${path.extname(file.originalname)}`;
+    cb(null, uniqueName);
   }
 });
 
-router.get('/', authenticate, (req, res) => {
-  const { deviation_id, measure_id, validation_id, uploaded_by } = req.query;
-  let sql = `SELECT ev.*, u.name as uploader_name FROM evidences ev
-    LEFT JOIN users u ON ev.uploaded_by_id = u.id WHERE 1=1`;
-  const params = [];
-  if (deviation_id) { sql += ' AND ev.deviation_id = ?'; params.push(deviation_id); }
-  if (measure_id) { sql += ' AND ev.measure_id = ?'; params.push(measure_id); }
-  if (validation_id) { sql += ' AND ev.validation_id = ?'; params.push(validation_id); }
-  if (uploaded_by) { sql += ' AND ev.uploaded_by_id = ?'; params.push(uploaded_by); }
-  sql += ' ORDER BY ev.created_at DESC';
-  const evidences = db.prepare(sql).all(...params);
+const upload = multer({ storage });
+
+router.get('/deviation/:deviationId', authenticateToken, (req, res) => {
+  const { deviationId } = req.params;
+  
+  const evidences = queryAll(`
+    SELECT ev.*, u.name as uploaded_by_name
+    FROM evidences ev
+    LEFT JOIN users u ON ev.uploaded_by = u.id
+    WHERE ev.deviation_id = ?
+    ORDER BY ev.created_at DESC
+  `, [deviationId]);
+
   res.json({ evidences });
 });
 
-router.post('/upload', authenticate, upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: '未上传文件' });
-  const { deviation_id, measure_id, validation_id, description } = req.body;
+router.get('/action/:actionId', authenticateToken, (req, res) => {
+  const { actionId } = req.params;
+  
+  const evidences = queryAll(`
+    SELECT ev.*, u.name as uploaded_by_name
+    FROM evidences ev
+    LEFT JOIN users u ON ev.uploaded_by = u.id
+    WHERE ev.action_id = ?
+    ORDER BY ev.created_at DESC
+  `, [actionId]);
+
+  res.json({ evidences });
+});
+
+router.get('/verification/:verificationId', authenticateToken, (req, res) => {
+  const { verificationId } = req.params;
+  
+  const evidences = queryAll(`
+    SELECT ev.*, u.name as uploaded_by_name
+    FROM evidences ev
+    LEFT JOIN users u ON ev.uploaded_by = u.id
+    WHERE ev.verification_id = ?
+    ORDER BY ev.created_at DESC
+  `, [verificationId]);
+
+  res.json({ evidences });
+});
+
+router.get('/:id/download', authenticateToken, (req, res) => {
+  const { id } = req.params;
+  
+  const evidence = queryOne('SELECT * FROM evidences WHERE id = ?', [id]);
+  if (!evidence) {
+    return res.status(404).json({ error: '证据文件不存在' });
+  }
+
+  const filePath = path.join(uploadDir, path.basename(evidence.file_path));
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: '文件不存在' });
+  }
+
+  res.download(filePath, evidence.file_name);
+});
+
+router.post('/upload', authenticateToken, upload.single('file'), (req, res) => {
+  const user = getCurrentUser(req);
+  const { deviation_id, action_id, verification_id, description } = req.body;
+
+  if (!req.file) {
+    return res.status(400).json({ error: '未上传文件' });
+  }
+
+  if (!deviation_id && !action_id && !verification_id) {
+    return res.status(400).json({ error: '必须指定关联的偏差、措施或验证记录' });
+  }
+
   const id = uuidv4();
-  const fileType = path.extname(req.file.originalname).substring(1).toUpperCase();
-  const filePath = req.file.path.replace(path.join(__dirname, '..', '..'), '').replace(/\\/g, '/');
-  db.prepare(`INSERT INTO evidences (id, deviation_id, measure_id, validation_id, file_name, file_path, file_size, file_type, uploaded_by_id, description)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(id, deviation_id || null, measure_id || null, validation_id || null,
-      req.file.originalname, filePath, req.file.size, fileType, req.user.id, description || '');
-  const evidence = db.prepare('SELECT * FROM evidences WHERE id = ?').get(id);
+  const file_path = req.file.filename;
+  const file_name = req.file.originalname;
+  const file_size = req.file.size;
+
+  runQuery(`
+    INSERT INTO evidences (id, deviation_id, action_id, verification_id, file_name, file_path, file_size, uploaded_by, description)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `, [id, deviation_id || null, action_id || null, verification_id || null, file_name, file_path, file_size, user.id, description || null]);
+
+  const evidence = queryOne(`
+    SELECT ev.*, u.name as uploaded_by_name
+    FROM evidences ev
+    LEFT JOIN users u ON ev.uploaded_by = u.id
+    WHERE ev.id = ?
+  `, [id]);
+
   res.status(201).json({ evidence });
 });
 
-router.delete('/:id', authenticate, (req, res) => {
+router.delete('/:id', authenticateToken, (req, res) => {
   const { id } = req.params;
-  const evidence = db.prepare('SELECT * FROM evidences WHERE id = ?').get(id);
-  if (!evidence) return res.status(404).json({ error: '证据不存在' });
-  if (evidence.uploaded_by_id !== req.user.id && req.user.role !== 'admin') {
-    return res.status(403).json({ error: '仅上传人或管理员可删除' });
+  const user = getCurrentUser(req);
+
+  const evidence = queryOne('SELECT * FROM evidences WHERE id = ?', [id]);
+  if (!evidence) {
+    return res.status(404).json({ error: '证据文件不存在' });
   }
-  const fullPath = path.join(__dirname, '..', '..', evidence.file_path);
-  if (fs.existsSync(fullPath)) {
-    try { fs.unlinkSync(fullPath); } catch (_) {}
+
+  if (evidence.uploaded_by !== user.id && user.role !== 'admin') {
+    return res.status(403).json({ error: '仅上传人或管理员可以删除' });
   }
-  db.prepare('DELETE FROM evidences WHERE id = ?').run(id);
-  res.json({ message: '删除成功' });
+
+  const filePath = path.join(uploadDir, path.basename(evidence.file_path));
+  if (fs.existsSync(filePath)) {
+    fs.unlinkSync(filePath);
+  }
+
+  runQuery('DELETE FROM evidences WHERE id = ?', [id]);
+  res.json({ success: true, message: '证据文件已删除' });
 });
 
 module.exports = router;

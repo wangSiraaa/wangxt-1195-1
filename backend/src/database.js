@@ -1,198 +1,506 @@
-const Database = require('better-sqlite3');
-const path = require('path');
+const initSqlJs = require('sql.js');
 const fs = require('fs');
+const path = require('path');
+const bcrypt = require('bcryptjs');
 
-const dbDir = path.join(__dirname, '..', 'data');
-if (!fs.existsSync(dbDir)) {
-  fs.mkdirSync(dbDir, { recursive: true });
+let db;
+const dbPath = path.join(__dirname, '..', 'data', 'capa.db');
+
+async function initDatabase() {
+  const SQL = await initSqlJs();
+  
+  const dataDir = path.join(__dirname, '..', 'data');
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+
+  if (fs.existsSync(dbPath)) {
+    const fileBuffer = fs.readFileSync(dbPath);
+    db = new SQL.Database(fileBuffer);
+    migrateDatabase();
+    saveDatabase();
+  } else {
+    db = new SQL.Database();
+    createTables();
+    seedInitialData();
+    saveDatabase();
+  }
+
+  return db;
 }
 
-const dbPath = path.join(dbDir, 'capa.db');
-const db = new Database(dbPath);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+function migrateDatabase() {
+  try {
+    const cols = db.exec("PRAGMA table_info(deviations)");
+    const colNames = cols[0]?.values.map(c => c[1]) || [];
+    
+    if (!colNames.includes('trend_group_id')) {
+      db.run('ALTER TABLE deviations ADD COLUMN trend_group_id TEXT REFERENCES deviation_trend_groups(id)');
+    }
+    if (!colNames.includes('trend_merged_comment')) {
+      db.run('ALTER TABLE deviations ADD COLUMN trend_merged_comment TEXT');
+    }
+  } catch (e) { console.log('migrate deviations:', e.message); }
 
-function initDatabase() {
-  const tables = [
-    `CREATE TABLE IF NOT EXISTS users (
+  try {
+    const cols = db.exec("PRAGMA table_info(capa_actions)");
+    const colNames = cols[0]?.values.map(c => c[1]) || [];
+    
+    if (!colNames.includes('is_rework')) {
+      db.run('ALTER TABLE capa_actions ADD COLUMN is_rework INTEGER DEFAULT 0');
+    }
+    if (!colNames.includes('rework_plan_id')) {
+      db.run('ALTER TABLE capa_actions ADD COLUMN rework_plan_id TEXT REFERENCES rework_plans(id)');
+    }
+    if (!colNames.includes('parent_action_id')) {
+      db.run('ALTER TABLE capa_actions ADD COLUMN parent_action_id TEXT REFERENCES capa_actions(id)');
+    }
+  } catch (e) { console.log('migrate capa_actions:', e.message); }
+
+  try {
+    const cols = db.exec("PRAGMA table_info(verifications)");
+    const colNames = cols[0]?.values.map(c => c[1]) || [];
+    
+    if (!colNames.includes('approval_status')) {
+      db.run('ALTER TABLE verifications ADD COLUMN approval_status TEXT DEFAULT \'pending\'');
+    }
+    if (!colNames.includes('rework_generated')) {
+      db.run('ALTER TABLE verifications ADD COLUMN rework_generated INTEGER DEFAULT 0');
+    }
+  } catch (e) { console.log('migrate verifications:', e.message); }
+
+  try {
+    const cols = db.exec("PRAGMA table_info(escalations)");
+    const colNames = cols[0]?.values.map(c => c[1]) || [];
+    
+    if (!colNames.includes('auto_generated')) {
+      db.run('ALTER TABLE escalations ADD COLUMN auto_generated INTEGER DEFAULT 0');
+    }
+  } catch (e) { console.log('migrate escalations:', e.message); }
+
+  const tablesToCreate = [
+    'deviation_trend_groups',
+    'trend_group_members',
+    'rework_plans',
+    'verification_approvals',
+    'action_escalation_logs'
+  ];
+  
+  tablesToCreate.forEach(tableName => {
+    try {
+      const result = db.exec(`SELECT name FROM sqlite_master WHERE type='table' AND name='${tableName}'`);
+      if (!result[0] || result[0].values.length === 0) {
+        if (tableName === 'deviation_trend_groups') {
+          db.run(`
+            CREATE TABLE IF NOT EXISTS deviation_trend_groups (
+              id TEXT PRIMARY KEY,
+              group_name TEXT NOT NULL,
+              root_cause_category TEXT,
+              description TEXT,
+              created_by TEXT NOT NULL,
+              created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+          `);
+        } else if (tableName === 'trend_group_members') {
+          db.run(`
+            CREATE TABLE IF NOT EXISTS trend_group_members (
+              id TEXT PRIMARY KEY,
+              group_id TEXT NOT NULL,
+              deviation_id TEXT NOT NULL,
+              joined_at TEXT DEFAULT CURRENT_TIMESTAMP,
+              joined_by TEXT NOT NULL,
+              relation_type TEXT DEFAULT 'same_root_cause',
+              comment TEXT,
+              UNIQUE(group_id, deviation_id)
+            )
+          `);
+        } else if (tableName === 'rework_plans') {
+          db.run(`
+            CREATE TABLE IF NOT EXISTS rework_plans (
+              id TEXT PRIMARY KEY,
+              deviation_id TEXT NOT NULL,
+              source_verification_id TEXT NOT NULL,
+              parent_action_id TEXT,
+              rework_reason TEXT NOT NULL,
+              plan_description TEXT NOT NULL,
+              status TEXT DEFAULT 'pending',
+              created_by TEXT NOT NULL,
+              approved_by TEXT,
+              approved_at TEXT,
+              approval_comment TEXT,
+              created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+          `);
+        } else if (tableName === 'verification_approvals') {
+          db.run(`
+            CREATE TABLE IF NOT EXISTS verification_approvals (
+              id TEXT PRIMARY KEY,
+              verification_id TEXT NOT NULL,
+              approver_id TEXT NOT NULL,
+              approval_type TEXT NOT NULL,
+              decision TEXT NOT NULL,
+              comment TEXT,
+              created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+          `);
+        } else if (tableName === 'action_escalation_logs') {
+          db.run(`
+            CREATE TABLE IF NOT EXISTS action_escalation_logs (
+              id TEXT PRIMARY KEY,
+              action_id TEXT NOT NULL,
+              deviation_id TEXT NOT NULL,
+              escalation_type TEXT NOT NULL,
+              reason TEXT NOT NULL,
+              escalated_from TEXT NOT NULL,
+              escalated_to TEXT NOT NULL,
+              level INTEGER DEFAULT 1,
+              created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+          `);
+        }
+      }
+    } catch (e) {
+      console.log(`migrate create ${tableName}:`, e.message);
+    }
+  });
+}
+
+function saveDatabase() {
+  const data = db.export();
+  const buffer = Buffer.from(data);
+  fs.writeFileSync(dbPath, buffer);
+}
+
+function createTables() {
+  db.run(`
+    CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       username TEXT UNIQUE NOT NULL,
       password TEXT NOT NULL,
       name TEXT NOT NULL,
-      role TEXT NOT NULL CHECK(role IN ('production', 'qa', 'validation', 'admin')),
+      role TEXT NOT NULL,
       department TEXT,
-      email TEXT,
-      phone TEXT,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )`,
-    `CREATE TABLE IF NOT EXISTS deviations (
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS deviations (
       id TEXT PRIMARY KEY,
-      code TEXT UNIQUE NOT NULL,
+      deviation_no TEXT UNIQUE NOT NULL,
       title TEXT NOT NULL,
       description TEXT NOT NULL,
-      department TEXT,
-      product TEXT,
-      batch_no TEXT,
-      occurrence_date TEXT NOT NULL,
+      product_batch TEXT,
+      equipment TEXT,
+      location TEXT,
+      discovered_date TEXT NOT NULL,
       reporter_id TEXT NOT NULL,
-      severity TEXT DEFAULT 'minor' CHECK(severity IN ('minor', 'major', 'critical')),
-      status TEXT DEFAULT 'draft' CHECK(status IN ('draft', 'submitted', 'root_cause_pending', 'root_cause_analysis', 'measures_pending', 'measures_implementing', 'validation_pending', 'validating', 'closed', 'cancelled')),
-      qa_evaluator_id TEXT,
-      qa_evaluation TEXT,
-      qa_evaluation_date TEXT,
-      verification_engineer_id TEXT,
-      root_cause TEXT,
-      root_cause_analysis_date TEXT,
-      root_cause_analyst_id TEXT,
-      closing_conclusion TEXT,
-      closing_date TEXT,
-      closed_by_id TEXT,
+      severity TEXT DEFAULT 'minor',
+      status TEXT DEFAULT 'draft',
+      qa_judge_id TEXT,
+      qa_judge_comment TEXT,
+      qa_judge_date TEXT,
+      root_cause_required INTEGER DEFAULT 0,
+      trend_group_id TEXT REFERENCES deviation_trend_groups(id),
+      trend_merged_comment TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (reporter_id) REFERENCES users(id),
-      FOREIGN KEY (qa_evaluator_id) REFERENCES users(id),
-      FOREIGN KEY (verification_engineer_id) REFERENCES users(id),
-      FOREIGN KEY (root_cause_analyst_id) REFERENCES users(id),
-      FOREIGN KEY (closed_by_id) REFERENCES users(id)
-    )`,
-    `CREATE TABLE IF NOT EXISTS approvals (
+      FOREIGN KEY (qa_judge_id) REFERENCES users(id)
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS deviation_approvals (
       id TEXT PRIMARY KEY,
       deviation_id TEXT NOT NULL,
-      stage TEXT NOT NULL,
       approver_id TEXT NOT NULL,
-      action TEXT NOT NULL CHECK(action IN ('submit', 'approve', 'reject', 'comment')),
+      approval_type TEXT NOT NULL,
+      decision TEXT NOT NULL,
       comment TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (deviation_id) REFERENCES deviations(id),
       FOREIGN KEY (approver_id) REFERENCES users(id)
-    )`,
-    `CREATE TABLE IF NOT EXISTS corrective_measures (
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS root_causes (
       id TEXT PRIMARY KEY,
       deviation_id TEXT NOT NULL,
-      type TEXT NOT NULL CHECK(type IN ('correction', 'preventive')),
+      description TEXT NOT NULL,
+      category TEXT,
+      analysis_method TEXT,
+      investigator_id TEXT,
+      is_confirmed INTEGER DEFAULT 0,
+      confirmed_by TEXT,
+      confirmed_at TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (deviation_id) REFERENCES deviations(id),
+      FOREIGN KEY (investigator_id) REFERENCES users(id),
+      FOREIGN KEY (confirmed_by) REFERENCES users(id)
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS capa_actions (
+      id TEXT PRIMARY KEY,
+      deviation_id TEXT NOT NULL,
+      action_type TEXT NOT NULL,
       description TEXT NOT NULL,
       responsible_id TEXT NOT NULL,
-      deadline TEXT NOT NULL,
-      actual_completion_date TEXT,
-      status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'in_progress', 'completed', 'overdue', 'verified')),
+      due_date TEXT NOT NULL,
+      actual_date TEXT,
+      status TEXT DEFAULT 'pending',
+      priority TEXT DEFAULT 'medium',
+      completion_evidence TEXT,
+      is_rework INTEGER DEFAULT 0,
+      rework_plan_id TEXT REFERENCES rework_plans(id),
+      parent_action_id TEXT REFERENCES capa_actions(id),
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (deviation_id) REFERENCES deviations(id),
+      FOREIGN KEY (responsible_id) REFERENCES users(id)
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS action_approvals (
+      id TEXT PRIMARY KEY,
+      action_id TEXT NOT NULL,
+      approver_id TEXT NOT NULL,
+      decision TEXT NOT NULL,
+      comment TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (action_id) REFERENCES capa_actions(id),
+      FOREIGN KEY (approver_id) REFERENCES users(id)
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS verifications (
+      id TEXT PRIMARY KEY,
+      deviation_id TEXT NOT NULL,
+      action_id TEXT,
+      verification_method TEXT NOT NULL,
       verification_result TEXT,
-      verification_date TEXT,
-      verified_by_id TEXT,
-      evidence_urls TEXT,
+      verifier_id TEXT NOT NULL,
+      verified_at TEXT,
+      is_passed INTEGER,
+      conclusion TEXT,
+      evidence_files TEXT,
+      approval_status TEXT DEFAULT 'pending',
+      rework_generated INTEGER DEFAULT 0,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (deviation_id) REFERENCES deviations(id),
-      FOREIGN KEY (responsible_id) REFERENCES users(id),
-      FOREIGN KEY (verified_by_id) REFERENCES users(id)
-    )`,
-    `CREATE TABLE IF NOT EXISTS validations (
+      FOREIGN KEY (action_id) REFERENCES capa_actions(id),
+      FOREIGN KEY (verifier_id) REFERENCES users(id)
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS escalations (
       id TEXT PRIMARY KEY,
       deviation_id TEXT NOT NULL,
-      title TEXT NOT NULL,
-      description TEXT NOT NULL,
-      protocol TEXT,
-      executor_id TEXT NOT NULL,
-      plan_start_date TEXT,
-      plan_end_date TEXT,
-      actual_start_date TEXT,
-      actual_end_date TEXT,
-      status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'in_progress', 'passed', 'failed', 'needs_retest')),
-      result_summary TEXT,
-      result_details TEXT,
-      non_conformance TEXT,
-      evidence_urls TEXT,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (deviation_id) REFERENCES deviations(id),
-      FOREIGN KEY (executor_id) REFERENCES users(id)
-    )`,
-    `CREATE TABLE IF NOT EXISTS escalations (
-      id TEXT PRIMARY KEY,
-      deviation_id TEXT NOT NULL,
-      measure_id TEXT,
-      level INTEGER NOT NULL,
+      action_id TEXT,
+      escalation_type TEXT NOT NULL,
       reason TEXT NOT NULL,
-      from_user_id TEXT NOT NULL,
-      to_user_id TEXT NOT NULL,
-      status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'acknowledged', 'resolved')),
-      acknowledgment TEXT,
-      acknowledged_at TEXT,
+      escalated_by TEXT NOT NULL,
+      escalated_to TEXT NOT NULL,
+      level INTEGER DEFAULT 1,
+      status TEXT DEFAULT 'open',
+      resolution TEXT,
+      resolved_at TEXT,
+      auto_generated INTEGER DEFAULT 0,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (deviation_id) REFERENCES deviations(id),
-      FOREIGN KEY (measure_id) REFERENCES corrective_measures(id),
-      FOREIGN KEY (from_user_id) REFERENCES users(id),
-      FOREIGN KEY (to_user_id) REFERENCES users(id)
-    )`,
-    `CREATE TABLE IF NOT EXISTS evidences (
+      FOREIGN KEY (action_id) REFERENCES capa_actions(id),
+      FOREIGN KEY (escalated_by) REFERENCES users(id),
+      FOREIGN KEY (escalated_to) REFERENCES users(id)
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS evidences (
       id TEXT PRIMARY KEY,
       deviation_id TEXT,
-      measure_id TEXT,
-      validation_id TEXT,
+      action_id TEXT,
+      verification_id TEXT,
       file_name TEXT NOT NULL,
       file_path TEXT NOT NULL,
       file_size INTEGER,
-      file_type TEXT,
-      uploaded_by_id TEXT NOT NULL,
+      uploaded_by TEXT NOT NULL,
       description TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (deviation_id) REFERENCES deviations(id),
-      FOREIGN KEY (measure_id) REFERENCES corrective_measures(id),
-      FOREIGN KEY (validation_id) REFERENCES validations(id),
-      FOREIGN KEY (uploaded_by_id) REFERENCES users(id)
-    )`
-  ];
+      FOREIGN KEY (action_id) REFERENCES capa_actions(id),
+      FOREIGN KEY (verification_id) REFERENCES verifications(id),
+      FOREIGN KEY (uploaded_by) REFERENCES users(id)
+    )
+  `);
 
-  const transaction = db.transaction(() => {
-    for (const sql of tables) {
-      db.exec(sql);
-    }
-  });
-  transaction();
+  db.run(`
+    CREATE TABLE IF NOT EXISTS close_conclusions (
+      id TEXT PRIMARY KEY,
+      deviation_id TEXT NOT NULL,
+      conclusion TEXT NOT NULL,
+      closed_by TEXT NOT NULL,
+      closed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      effectiveness_review TEXT,
+      lessons_learned TEXT,
+      FOREIGN KEY (deviation_id) REFERENCES deviations(id),
+      FOREIGN KEY (closed_by) REFERENCES users(id)
+    )
+  `);
 
-  const userCount = db.prepare('SELECT COUNT(*) as count FROM users').get().count;
-  if (userCount === 0) {
-    const bcrypt = require('bcryptjs');
-    const { v4: uuidv4 } = require('uuid');
-    const defaultUsers = [
-      { id: uuidv4(), username: 'admin', name: '系统管理员', role: 'admin', password: 'admin123', department: 'IT部', email: 'admin@pharma.com' },
-      { id: uuidv4(), username: 'prod01', name: '张伟', role: 'production', password: 'prod123', department: '固体制剂车间', email: 'zhangwei@pharma.com' },
-      { id: uuidv4(), username: 'prod02', name: '李娜', role: 'production', password: 'prod123', department: '注射剂车间', email: 'lina@pharma.com' },
-      { id: uuidv4(), username: 'qa01', name: '王芳', role: 'qa', password: 'qa123', department: '质量保证部', email: 'wangfang@pharma.com' },
-      { id: uuidv4(), username: 'qa02', name: '陈强', role: 'qa', password: 'qa123', department: '质量保证部', email: 'chenqiang@pharma.com' },
-      { id: uuidv4(), username: 'val01', name: '刘洋', role: 'validation', password: 'val123', department: '验证部', email: 'liuyang@pharma.com' },
-      { id: uuidv4(), username: 'val02', name: '赵敏', role: 'validation', password: 'val123', department: '验证部', email: 'zhaomin@pharma.com' }
-    ];
-    const insertUser = db.prepare('INSERT INTO users (id, username, password, name, role, department, email) VALUES (?, ?, ?, ?, ?, ?, ?)');
-    const insertMany = db.transaction((users) => {
-      for (const u of users) {
-        const hashedPwd = bcrypt.hashSync(u.password, 8);
-        insertUser.run(u.id, u.username, hashedPwd, u.name, u.role, u.department, u.email);
-      }
-    });
-    insertMany(defaultUsers);
-  }
+  db.run(`
+    CREATE TABLE IF NOT EXISTS deviation_trend_groups (
+      id TEXT PRIMARY KEY,
+      group_name TEXT NOT NULL,
+      root_cause_category TEXT,
+      description TEXT,
+      created_by TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (created_by) REFERENCES users(id)
+    )
+  `);
 
-  const indexSqls = [
-    'CREATE INDEX IF NOT EXISTS idx_deviations_status ON deviations(status)',
-    'CREATE INDEX IF NOT EXISTS idx_deviations_severity ON deviations(severity)',
-    'CREATE INDEX IF NOT EXISTS idx_deviations_reporter ON deviations(reporter_id)',
-    'CREATE INDEX IF NOT EXISTS idx_approvals_deviation ON approvals(deviation_id)',
-    'CREATE INDEX IF NOT EXISTS idx_measures_deviation ON corrective_measures(deviation_id)',
-    'CREATE INDEX IF NOT EXISTS idx_measures_status ON corrective_measures(status)',
-    'CREATE INDEX IF NOT EXISTS idx_measures_deadline ON corrective_measures(deadline)',
-    'CREATE INDEX IF NOT EXISTS idx_validations_deviation ON validations(deviation_id)',
-    'CREATE INDEX IF NOT EXISTS idx_escalations_deviation ON escalations(deviation_id)',
-    'CREATE INDEX IF NOT EXISTS idx_escalations_status ON escalations(status)'
-  ];
-  const idxTransaction = db.transaction(() => {
-    for (const sql of indexSqls) {
-      db.exec(sql);
-    }
-  });
-  idxTransaction();
+  db.run(`
+    CREATE TABLE IF NOT EXISTS trend_group_members (
+      id TEXT PRIMARY KEY,
+      group_id TEXT NOT NULL,
+      deviation_id TEXT NOT NULL,
+      joined_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      joined_by TEXT NOT NULL,
+      relation_type TEXT DEFAULT 'same_root_cause',
+      comment TEXT,
+      FOREIGN KEY (group_id) REFERENCES deviation_trend_groups(id),
+      FOREIGN KEY (deviation_id) REFERENCES deviations(id),
+      FOREIGN KEY (joined_by) REFERENCES users(id),
+      UNIQUE(group_id, deviation_id)
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS rework_plans (
+      id TEXT PRIMARY KEY,
+      deviation_id TEXT NOT NULL,
+      source_verification_id TEXT NOT NULL,
+      parent_action_id TEXT,
+      rework_reason TEXT NOT NULL,
+      plan_description TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      created_by TEXT NOT NULL,
+      approved_by TEXT,
+      approved_at TEXT,
+      approval_comment TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (deviation_id) REFERENCES deviations(id),
+      FOREIGN KEY (source_verification_id) REFERENCES verifications(id),
+      FOREIGN KEY (parent_action_id) REFERENCES capa_actions(id),
+      FOREIGN KEY (created_by) REFERENCES users(id),
+      FOREIGN KEY (approved_by) REFERENCES users(id)
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS verification_approvals (
+      id TEXT PRIMARY KEY,
+      verification_id TEXT NOT NULL,
+      approver_id TEXT NOT NULL,
+      approval_type TEXT NOT NULL,
+      decision TEXT NOT NULL,
+      comment TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (verification_id) REFERENCES verifications(id),
+      FOREIGN KEY (approver_id) REFERENCES users(id)
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS action_escalation_logs (
+      id TEXT PRIMARY KEY,
+      action_id TEXT NOT NULL,
+      deviation_id TEXT NOT NULL,
+      escalation_type TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      escalated_from TEXT NOT NULL,
+      escalated_to TEXT NOT NULL,
+      level INTEGER DEFAULT 1,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (action_id) REFERENCES capa_actions(id),
+      FOREIGN KEY (deviation_id) REFERENCES deviations(id),
+      FOREIGN KEY (escalated_from) REFERENCES users(id),
+      FOREIGN KEY (escalated_to) REFERENCES users(id)
+    )
+  `);
 }
 
-initDatabase();
+function seedInitialData() {
+  const users = [
+    { id: 'u1', username: 'production1', password: bcrypt.hashSync('123456', 10), name: '张伟', role: 'production', department: '生产一车间' },
+    { id: 'u2', username: 'production2', password: bcrypt.hashSync('123456', 10), name: '李芳', role: 'production', department: '生产二车间' },
+    { id: 'u3', username: 'qa1', password: bcrypt.hashSync('123456', 10), name: '王磊', role: 'qa', department: '质量保证部' },
+    { id: 'u4', username: 'qa2', password: bcrypt.hashSync('123456', 10), name: '赵敏', role: 'qa', department: '质量保证部' },
+    { id: 'u5', username: 'validation1', password: bcrypt.hashSync('123456', 10), name: '刘洋', role: 'validation', department: '验证工程部' },
+    { id: 'u6', username: 'validation2', password: bcrypt.hashSync('123456', 10), name: '陈静', role: 'validation', department: '验证工程部' },
+    { id: 'u7', username: 'admin', password: bcrypt.hashSync('123456', 10), name: '系统管理员', role: 'admin', department: '信息部' }
+  ];
 
-module.exports = db;
+  const stmt = db.prepare('INSERT INTO users (id, username, password, name, role, department) VALUES (?, ?, ?, ?, ?, ?)');
+  users.forEach(u => {
+    stmt.run([u.id, u.username, u.password, u.name, u.role, u.department]);
+  });
+  stmt.free();
+}
+
+function getDb() {
+  if (!db) {
+    throw new Error('Database not initialized');
+  }
+  return db;
+}
+
+function runQuery(sql, params = []) {
+  const stmt = db.prepare(sql);
+  stmt.run(params);
+  stmt.free();
+  saveDatabase();
+}
+
+function queryAll(sql, params = []) {
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  const results = [];
+  while (stmt.step()) {
+    results.push(stmt.getAsObject());
+  }
+  stmt.free();
+  return results;
+}
+
+function queryOne(sql, params = []) {
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  let result = null;
+  if (stmt.step()) {
+    result = stmt.getAsObject();
+  }
+  stmt.free();
+  return result;
+}
+
+module.exports = {
+  initDatabase,
+  getDb,
+  saveDatabase,
+  runQuery,
+  queryAll,
+  queryOne
+};
